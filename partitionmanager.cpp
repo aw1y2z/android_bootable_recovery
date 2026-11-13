@@ -17,6 +17,7 @@
 */
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
@@ -3058,32 +3059,71 @@ void TWPartitionManager::OverrideActiveSlot(const std::string& slot) {
 #endif
 }
 
+
+// 用 vendor 的 bootctrl hw module 切槽：它按 GPT attributes + xbl boot LUN 操作，
+// 与高通 bootloader 的约定一致。AOSP 的 libboot_control 只写 misc 的 BCAB，
+// 高通 BL 不认，所以界面上切换后仍然从原槽启动。
+static bool SetActiveSlotViaVendorBootctrl(int slot_number) {
+  static const char* kModules[] = {
+      "/system/lib64/hw/bootctrl.qcom.so",
+      "/vendor/lib64/hw/bootctrl.qcom.so",
+      "/system/lib64/hw/bootctrl.xiaomi_sm8550.so",
+  };
+  for (const char* path : kModules) {
+    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) continue;
+    void* module = dlsym(handle, "HMI");
+    auto set_active =
+        reinterpret_cast<int (*)(void*, unsigned)>(dlsym(handle, "set_active_boot_slot"));
+    auto get_number =
+        reinterpret_cast<unsigned (*)(void*)>(dlsym(handle, "get_number_slots"));
+    if (module == nullptr || set_active == nullptr) {
+      dlclose(handle);
+      continue;
+    }
+    const unsigned slots = get_number != nullptr ? get_number(module) : 2;
+    if (slot_number < 0 || static_cast<unsigned>(slot_number) >= slots) {
+      LOGERR("vendor bootctrl %s: slot %d out of range (slots=%u)\n", path, slot_number, slots);
+      dlclose(handle);
+      return false;
+    }
+    const int rc = set_active(module, static_cast<unsigned>(slot_number));
+    LOGINFO("vendor bootctrl %s: set_active_boot_slot(%d) -> %d\n", path, slot_number, rc);
+    dlclose(handle);
+    return rc == 0;
+  }
+  LOGINFO("vendor bootctrl module not usable, falling back to boot control HAL\n");
+  return false;
+}
+
 void TWPartitionManager::SetActiveSlot(const std::string& slot) {
   if (slot != "A" && slot != "B") {
     LOGERR("SetActiveSlot invalid slot '%s'\n", slot.c_str());
     return;
   }
-  if (active_slot_display_ == slot) return;
   LOGINFO("Setting active slot %s\n", slot.c_str());
 #ifdef AB_OTA_UPDATER
   if (!active_slot_display_.empty()) {
-    if (const auto module = BootControlClient::WaitForService(); !module) {
-      LOGERR("Error getting bootctrl module.\n");
-    } else {
-      int32_t slot_number = 0;
-      if (slot == "B") slot_number = 1;
-      if (const auto [success, errMsg] = module->SetActiveBootSlot(slot_number); !success) {
-        gui2_console::log_error("unable_set_boot_slot", slot);
+    const int32_t slot_number = (slot == "B") ? 1 : 0;
+    // vendor 实现能真正改 GPT 并设置 boot LUN，优先走它
+    bool switched = SetActiveSlotViaVendorBootctrl(slot_number);
+    if (!switched) {
+      const auto module = BootControlClient::WaitForService();
+      if (!module) {
+        LOGERR("Error getting bootctrl module.\n");
+      } else {
+        const auto [success, errMsg] = module->SetActiveBootSlot(slot_number);
+        switched = success;
+        if (!success) gui2_console::log_error("unable_set_boot_slot", slot);
       }
     }
-    DataManager::SetValue("tw_active_slot", slot);
-    // Doing this outside of this if block may result in a seg fault because the DataManager may not be ready yet
+    // 切槽失败时不改动当前槽显示，避免界面误报已切换
+    if (!switched) return;
   }
 #else
   LOGERR("Boot slot feature not present\n");
   return;
 #endif
-  active_slot_display_ = slot;
   if (FstabProcessed()) UpdateSystemDetails();
 }
 
@@ -3095,6 +3135,46 @@ std::string TWPartitionManager::GetActiveSlotSuffix() const {
 
 std::string TWPartitionManager::GetActiveSlotDisplay() {
   return active_slot_display_;
+}
+
+void TWPartitionManager::RefreshActiveSlotFromHal() {
+#ifdef AB_OTA_UPDATER
+  // 构造函数只能从内核 cmdline 的 ro.boot.slot_suffix 取槽位，fuxi 在 recovery 里该属性
+  // 为空，界面就不会出现槽位选择。这里用 boot control HAL 读实际运行槽补齐，HAL 不可用
+  // 时保留 cmdline 的结果；只填运行槽，不碰下次启动槽。
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    const auto module = android::hal::BootControlClient::WaitForService();
+    if (!module) {
+      usleep(200000);
+      continue;
+    }
+
+    const int32_t current = module->GetCurrentSlot();
+    if (current < 0) {
+      LOGINFO("Boot control HAL does not report a current slot\n");
+      return;
+    }
+
+    const std::string suffix = module->GetSuffix(current);
+    if (suffix != "_a" && suffix != "_b") {
+      LOGINFO("Boot control HAL returned unexpected current suffix '%s'\n", suffix.c_str());
+      return;
+    }
+
+    const std::string slot = suffix == "_a" ? "A" : "B";
+    if (slot != active_slot_display_) {
+      LOGINFO("Current slot from boot control HAL: %s (cmdline: '%s')\n", slot.c_str(),
+              active_slot_display_.c_str());
+      active_slot_display_ = slot;
+    }
+    return;
+  }
+
+  LOGINFO("Boot control HAL not available, keeping slot '%s' from cmdline\n",
+          active_slot_display_.c_str());
+#else
+  LOGINFO("Boot slot not supported on non-A/B device\n");
+#endif
 }
 
 std::string TWPartitionManager::GetAndroidRootPath() {

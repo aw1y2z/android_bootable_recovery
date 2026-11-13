@@ -323,6 +323,8 @@ static bool run_early_startup(startup_hooks* hooks) {
 	if (!TWFunc::IsPathExists(fstab_filename)) {
 		fstab_filename = "/etc/recovery.fstab";
 	}
+	// 槽位以运行中的槽为准，fstab 里 SlotSelect 的分区随之解析
+	PartitionManager.RefreshActiveSlotFromHal();
 	printf("=> Processing %s\n", fstab_filename.c_str());
 	if (!PartitionManager.ProcessFstab(fstab_filename, true, true)) {
 		LOGERR("Failing out of recovery due to problem with fstab.\n");
@@ -347,6 +349,8 @@ static bool run_fastboot_startup(startup_hooks* hooks) {
 	if (!TWFunc::IsPathExists(fstab_filename)) {
 		fstab_filename = "/etc/recovery.fstab";
 	}
+	// 槽位以运行中的槽为准，fstab 里 SlotSelect 的分区随之解析
+	PartitionManager.RefreshActiveSlotFromHal();
 	printf("=> Processing %s\n", fstab_filename.c_str());
 	if (!PartitionManager.ProcessFstab(fstab_filename, true, false)) {
 		LOGERR("Failing out of recovery due to problem with fstab.\n");

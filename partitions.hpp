@@ -865,6 +865,9 @@ public:
   // Returns active slot _a or _b
   [[nodiscard]] std::string GetActiveSlotSuffix() const;
 
+  // Re-reads the running slot from the boot control HAL when cmdline is empty
+  void RefreshActiveSlotFromHal();
+
   // Returns active slot A or B for display purposes
   std::string GetActiveSlotDisplay();
 
